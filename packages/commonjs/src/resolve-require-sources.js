@@ -27,6 +27,9 @@ export function getRequireResolver(extensions, detectCyclesAndConditional) {
     return false;
   };
 
+  // Once a module is listed here, its type (wrapped or not) is fixed and may
+  // not change for the rest of the current build, to not break already
+  // transformed modules.
   const fullyAnalyzedModules = Object.create(null);
 
   const getTypeForFullyAnalyzedModule = (id) => {
@@ -34,7 +37,6 @@ export function getRequireResolver(extensions, detectCyclesAndConditional) {
     if (knownType !== true || !detectCyclesAndConditional || fullyAnalyzedModules[id]) {
       return knownType;
     }
-    fullyAnalyzedModules[id] = true;
     if (isCyclic(id)) {
       return (knownCjsModuleTypes[id] = IS_WRAPPED_COMMONJS);
     }
@@ -42,13 +44,11 @@ export function getRequireResolver(extensions, detectCyclesAndConditional) {
   };
 
   const setInitialParentType = (id, initialCommonJSType) => {
-    // It is possible a transformed module is already fully analyzed when using
-    // the cache and one dependency introduces a new cycle. Then transform is
-    // run for a fully analzyed module again. Fully analyzed modules may never
-    // change their type as importers already trust their type.
-    knownCjsModuleTypes[id] = fullyAnalyzedModules[id]
-      ? knownCjsModuleTypes[id]
-      : initialCommonJSType;
+    // Fully analyzed modules may never change type
+    if (fullyAnalyzedModules[id]) {
+      return;
+    }
+    knownCjsModuleTypes[id] = initialCommonJSType;
     if (
       detectCyclesAndConditional &&
       knownCjsModuleTypes[id] === true &&
@@ -59,7 +59,7 @@ export function getRequireResolver(extensions, detectCyclesAndConditional) {
     }
   };
 
-  const setTypesForRequiredModules = async (parentId, resolved, isConditional, loadModule) => {
+  const analyzeRequiredModule = async (parentId, resolved, isConditional, loadModule) => {
     const childId = resolved.id;
     requiredIds[childId] = true;
     if (!(isConditional || knownCjsModuleTypes[parentId] === IS_WRAPPED_COMMONJS)) {
@@ -68,9 +68,10 @@ export function getRequireResolver(extensions, detectCyclesAndConditional) {
 
     getDependencies(parentId).add(childId);
     if (!isCyclic(childId)) {
-      // This makes sure the current transform handler waits for all direct dependencies to be
-      // loaded and transformed and therefore for all transitive CommonJS dependencies to be
-      // loaded as well so that all cycles have been found and knownCjsModuleTypes is reliable.
+      // This makes sure the current transform handler waits for all direct
+      // dependencies to be loaded and transformed and therefore for all
+      // transitive CommonJS dependencies to be loaded as well so that all
+      // cycles have been found and knownCjsModuleTypes is reliable.
       await loadModule(resolved);
     }
   };
@@ -89,7 +90,7 @@ export function getRequireResolver(extensions, detectCyclesAndConditional) {
       setInitialParentType(parentId, parentMeta.initialCommonJSType);
       await Promise.all(
         parentMeta.requires.map(({ resolved, isConditional }) =>
-          setTypesForRequiredModules(parentId, resolved, isConditional, this.load)
+          analyzeRequiredModule(parentId, resolved, isConditional, this.load)
         )
       );
       if (getTypeForFullyAnalyzedModule(parentId) !== parentMeta.isCommonJS) {
@@ -101,6 +102,14 @@ export function getRequireResolver(extensions, detectCyclesAndConditional) {
         if (getTypeForFullyAnalyzedModule(id) !== parentMeta.isRequiredCommonJS[id]) {
           return true;
         }
+      }
+      // Now that we decided to go with the cached copy, neither the parent
+      // module nor any of its children may change types anymore
+      fullyAnalyzedModules[parentId] = true;
+      for (const {
+        resolved: { id }
+      } of parentMeta.requires) {
+        fullyAnalyzedModules[id] = true;
       }
       return false;
     },
@@ -133,16 +142,18 @@ export function getRequireResolver(extensions, detectCyclesAndConditional) {
             return { id: wrapId(childId, EXTERNAL_SUFFIX), allowProxy: false };
           }
           parentMeta.requires.push({ resolved, isConditional });
-          await setTypesForRequiredModules(parentId, resolved, isConditional, rollupContext.load);
+          await analyzeRequiredModule(parentId, resolved, isConditional, rollupContext.load);
           return { id: childId, allowProxy: true };
         })
       );
       parentMeta.isCommonJS = getTypeForFullyAnalyzedModule(parentId);
+      fullyAnalyzedModules[parentId] = true;
       return requireTargets.map(({ id: dependencyId, allowProxy }, index) => {
         // eslint-disable-next-line no-multi-assign
         const isCommonJS = (parentMeta.isRequiredCommonJS[
           dependencyId
         ] = getTypeForFullyAnalyzedModule(dependencyId));
+        fullyAnalyzedModules[dependencyId] = true;
         return {
           source: sources[index].source,
           id: allowProxy
